@@ -14,7 +14,7 @@ import multiprocessing as mp
 import threading
 import time
 
-from common import (CpuSampler, GpuSampler, append_jsonl, find_videos, merge_metrics_json,
+from common import (CpuSampler, GpuSampler, append_jsonl, effective_cpus, find_videos, merge_metrics_json,
                     output_root, probe_video)
 
 
@@ -106,7 +106,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--videos", default=None, help="glob; default $DATA_ROOT/videos/**")
     ap.add_argument("--seconds", type=float, default=20)
-    ap.add_argument("--cpu-procs", default="1,4,8,16,0", help="0 = os.cpu_count()")
+    ap.add_argument("--cpu-procs", default="1,4,8,0", help="0 = effective (cgroup) cpu count")
     ap.add_argument("--cpu-threads", type=int, default=1, help="ffmpeg threads per decoder")
     ap.add_argument("--gpu-decoders", default="1,2,4,8,16,32")
     ap.add_argument("--gpu-batch", type=int, default=8)
@@ -123,7 +123,7 @@ def main():
 
     best = {}
     for p in [int(x) for x in args.cpu_procs.split(",")]:
-        p = p or os.cpu_count()
+        p = p or effective_cpus()
         row = run_cpu(videos, p, args.seconds, args.cpu_threads)
         row["realtime_streams"] = row["aggregate_fps"] / src_fps
         print("DECODE", row, flush=True)

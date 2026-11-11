@@ -12,6 +12,28 @@ from pathlib import Path
 VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv", ".h264", ".h265")
 
 
+def effective_cpus() -> int:
+    """CPUs this container may actually use (cgroup quota), not the host's count.
+
+    AutoDL containers see all host cores in os.cpu_count() (e.g. 128) but are
+    throttled by a CFS quota (e.g. 12 cores).
+    """
+    n = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    try:
+        quota, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()[:2]
+        if quota != "max":
+            n = min(n, max(1, int(int(quota) / int(period))))
+    except Exception:  # noqa: BLE001
+        try:
+            q = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text())
+            p = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text())
+            if q > 0:
+                n = min(n, max(1, q // p))
+        except Exception:  # noqa: BLE001
+            pass
+    return n
+
+
 def output_root() -> Path:
     p = Path(os.environ.get("OUTPUT_ROOT", "output"))
     p.mkdir(parents=True, exist_ok=True)
@@ -109,7 +131,11 @@ class CpuSampler:
         self.cpu = self._ps.cpu_percent(None) if self._ps else None
 
     def summary(self) -> dict:
-        return {"cpu_util_mean": self.cpu, "ncpu": os.cpu_count()}
+        # psutil.cpu_percent is relative to ALL host cores; rescale to the quota
+        ncpu = effective_cpus()
+        host = os.cpu_count() or ncpu
+        util = None if self.cpu is None else min(100.0, self.cpu * host / ncpu)
+        return {"cpu_util_mean": util, "ncpu": ncpu}
 
 
 def append_jsonl(path: Path, row: dict) -> None:
