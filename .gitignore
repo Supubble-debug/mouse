@@ -1,0 +1,17 @@
+# >>> projtool:0.4.2 >>>
+# Common Python noise
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+
+# projtool per-worktree scaffold
+.mutagen.yml
+/data
+# <<< projtool <<<
