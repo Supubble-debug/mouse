@@ -12,7 +12,9 @@
 #   1080p30  -> $DATA_ROOT/videos/       (what find_videos() picks up)
 set -euo pipefail
 export PATH="/root/miniconda3/bin:$PATH"
-[ -f /etc/network_turbo ] && source /etc/network_turbo || true
+# NOTE: do NOT source /etc/network_turbo here -- it routes zenodo through AutoDL's
+# github/hf proxy at ~30 KB/s vs ~1.3 MB/s direct (measured 2026-11-11).
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
 DATA_ROOT=${DATA_ROOT:-/root/autodl-fs/datasets/mouse}
 RAW=$DATA_ROOT/videos_raw
@@ -28,9 +30,13 @@ NAMES=(
   mice_7_664x630_67Hz_7min21s.mp4
 )
 
+echo "== download ${#NAMES[@]} files in parallel"
 for n in "${NAMES[@]}"; do
-  echo "== download $n"
-  wget -q -c --tries=5 -O "$RAW/$n" "$BASE/$n?download=1"
+  wget -q -c --tries=10 --timeout=60 -O "$RAW/$n" "$BASE/$n?download=1" &
+done
+wait
+for n in "${NAMES[@]}"; do
+  echo "== $n"
   ffprobe -v error -select_streams v:0 \
     -show_entries stream=codec_name,width,height,avg_frame_rate,nb_frames -of csv=p=0 "$RAW/$n"
 done
