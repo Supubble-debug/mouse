@@ -1,0 +1,11 @@
+# ByteTrack config for the throughput benchmark.
+# Thresholds are near zero so the forced low-confidence detections from COCO weights
+# (see l0_ultralytics.py --conf/--max-det) still form tracks, giving a realistic
+# tracker workload. Restore normal thresholds (0.25/0.1/0.25) for fine-tuned weights.
+tracker_type: bytetrack
+track_high_thresh: 0.0005
+track_low_thresh: 0.0001
+new_track_thresh: 0.0005
+track_buffer: 30
+match_thresh: 0.8
+fuse_score: true
