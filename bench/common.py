@@ -162,5 +162,7 @@ class MetricSeries:
 def merge_metrics_json(root: Path, new: dict) -> None:
     p = root / "metrics.json"
     cur = json.loads(p.read_text()) if p.exists() else {}
-    cur.update(new)
+    import math
+    # projtool rejects non-finite values in metrics.json; keep them out
+    cur.update({k: v for k, v in new.items() if not (isinstance(v, float) and not math.isfinite(v))})
     p.write_text(json.dumps(cur, indent=2, ensure_ascii=False))
