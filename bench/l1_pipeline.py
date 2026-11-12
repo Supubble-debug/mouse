@@ -64,7 +64,7 @@ def letterbox_geom(imgsz: int):
 
 
 # ---------------------------------------------------------------- decoders
-def _frames(path: str, threads: int):
+def _frames(path: str, threads: int, opts: dict | None = None):
     import av
     while True:  # loop the file forever
         with av.open(path) as c:
@@ -74,6 +74,8 @@ def _frames(path: str, threads: int):
                 vs.thread_type = "AUTO" if threads > 1 else "SLICE"
             except Exception:  # noqa: BLE001
                 pass
+            if opts:  # e.g. skip_loop_filter=all; applied when the decoder opens
+                vs.codec_context.options = dict(opts)
             yield from c.decode(vs)
 
 
@@ -89,12 +91,12 @@ def copy_yuv(f, dst: np.ndarray) -> None:
         off += h * w
 
 
-def _decoder(assign, nslots, nring, stride, threads, ring_path, state_raw, ctr_raw, stop, barrier):
+def _decoder(assign, nslots, nring, stride, threads, opts, ring_path, state_raw, ctr_raw, stop, barrier):
     os.environ["OMP_NUM_THREADS"] = "1"
     ring = np.memmap(ring_path, dtype=np.uint8, mode="r+", shape=(nring, SLOT_BYTES))
     state = np.frombuffer(state_raw, dtype=np.int8)
     ctr = np.frombuffer(ctr_raw, dtype=np.int64)
-    gens = [(s, _frames(p, threads)) for s, p in assign]
+    gens = [(s, _frames(p, threads, opts)) for s, p in assign]
     nsrc = {s: 0 for s, _ in assign}
     nput = {s: 0 for s, _ in assign}
     barrier.wait()
@@ -253,6 +255,7 @@ class GpuEngine:
         torch.cuda.set_stream(self.stream)
         self.r, self.nh, self.nw, self.in_h, self.in_w, self.top, self.left = letterbox_geom(a.imgsz)
         self.K, self.maxb = a.topk, a.max_batch
+        self.buckets = sorted({min(int(b), a.max_batch) for b in a.batch_buckets.split(",")} | {a.max_batch})
         self.mask_res, self.pre_nms, self.nms_iou = a.mask_res, a.pre_nms, a.nms_iou
         self.off = torch.tensor([self.left, self.top, self.left, self.top], device=self.dev,
                                 dtype=torch.float32)
@@ -266,7 +269,7 @@ class GpuEngine:
         self.ys = torch.arange(self.in_h, device=self.dev, dtype=torch.float32)
         self.host = None
         self.host_pinned = False
-        for b in (1, self.maxb, 1):  # warm-up (TRT context / cuBLAS / allocator)
+        for b in self.buckets:  # warm-up every shape we will ever run (TRT / cuBLAS / allocator)
             self.infer(torch.zeros((b, SLOT_BYTES), dtype=torch.uint8, device=self.dev))
         torch.cuda.synchronize()
 
@@ -380,16 +383,20 @@ class GpuEngine:
                 pass
         self.host = None
 
+    def bucket(self, B: int) -> int:
+        return next((b for b in self.buckets if b >= B), self.maxb)
+
     def launch(self, idx: np.ndarray):
         torch = self.torch
         B = len(idx)
-        gi = self.gpu_in[:B]
+        Bp = self.bucket(B)  # pad to a fixed bucket; padded rows hold stale frames, results dropped
+        gi = self.gpu_in[:Bp]
         for i, j in enumerate(idx.tolist()):
             gi[i].copy_(self.host[j], non_blocking=True)
         res = self.infer(gi)
         out = self.out[self.flip][:B]
         self.flip ^= 1
-        out.copy_(res, non_blocking=True)
+        out.copy_(res[:B], non_blocking=True)
         evt = torch.cuda.Event()
         evt.record()
         return idx, out, evt
@@ -429,11 +436,15 @@ def gather(state, ctr, nslots, maxb, minb, timeout_s, have_pending):
     return idx
 
 
-def run_point(eng: GpuEngine, videos, n, stride, a):
+def run_point(eng: GpuEngine, videos, n, stride, a, dcfg=(0, 1, None)):
+    import torch
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    dec_n, dec_threads, dec_opts = dcfg
     ncpu = effective_cpus()
     # one tracker proc handled >=1600 updates/s with zero backlog in L1; a 2nd one costs a decoder
     T = a.trackers or (1 if min(n * 30 / stride, 3600) <= 2000 else 2)
-    D = a.decoders or max(1, min(n, ncpu - T - 1))
+    D = dec_n or max(1, min(n, ncpu - T - 1))
     S = a.slots
     nring = n * S
     need = nring * SLOT_BYTES
@@ -451,7 +462,7 @@ def run_point(eng: GpuEngine, videos, n, stride, a):
     assign = [[] for _ in range(D)]
     for s in range(n):
         assign[s % D].append((s, videos[s % len(videos)]))
-    procs = [ctx.Process(target=_decoder, args=(assign[d], S, nring, stride, a.dec_threads, ring_path,
+    procs = [ctx.Process(target=_decoder, args=(assign[d], S, nring, stride, dec_threads, dec_opts, ring_path,
                                                  state_raw, ctr_raw, stop, barrier), daemon=True)
              for d in range(D)]
     procs += [ctx.Process(target=_tracker, args=(qs[t], prog_raw, objs_raw, nfr_raw, stride, a.conf,
@@ -549,7 +560,11 @@ def run_point(eng: GpuEngine, videos, n, stride, a):
     nb = max(s1["batches"] - s0["batches"], 1)
     share = {f"share_{k}": (s1[k] - s0[k]) / dt for k in ("wait_gather", "wait_gpu", "cpu_launch", "cpu_finish")}
     return {"pipeline": a.tag, "backend": eng.backend_name, "mask_res": eng.mask_res, "streams": n, "stride": stride,
-            "decoders": D, "trackers": T, "slots": S, "host_pinned": eng.host_pinned,
+            "decoders": D, "dec_threads": dec_threads,
+            "dec_opts": ",".join(f"{k}={v}" for k, v in (dec_opts or {}).items()),
+            "trackers": T, "slots": S, "host_pinned": eng.host_pinned,
+            "torch_reserved_peak_gb": torch.cuda.max_memory_reserved() / 2**30,
+            "torch_alloc_peak_gb": torch.cuda.max_memory_allocated() / 2**30,
             "src_fps_min": float(src.min()), "src_fps_mean": float(src.mean()),
             "agg_src_fps": float(src.sum()), "agg_infer_fps": frames / dt,
             "objs_per_frame": float((snap1[2] - snap0[2]).sum() / max(frames, 1)),
@@ -608,6 +623,21 @@ def check(eng: GpuEngine, video: str, a) -> dict:
     return res
 
 
+def parse_dec_configs(spec: str):
+    """'10:1,11:1,11:1:skip_loop_filter=all+flags2=+fast' -> [(decoders, threads, {opt: val})]"""
+    out = []
+    for item in spec.split(","):
+        parts = item.strip().split(":")
+        opts = dict(kv.split("=", 1) for kv in parts[2].split("+") if kv) if len(parts) > 2 and parts[2] else None
+        out.append((int(parts[0]), int(parts[1]) if len(parts) > 1 else 1, opts))
+    return out
+
+
+def dcfg_label(d) -> str:
+    n, t, o = d
+    return f"d{n}t{t}" + ("_" + "_".join(v for v in (o or {}).values()) if o else "")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--videos", default=None)
@@ -629,6 +659,11 @@ def main():
     ap.add_argument("--decoders", type=int, default=0, help="0 = auto (cpus - trackers - 1)")
     ap.add_argument("--trackers", type=int, default=0, help="0 = auto")
     ap.add_argument("--dec-threads", type=int, default=1)
+    ap.add_argument("--dec-configs", default="",
+                    help="sweep decoder setups: 'D:threads[:opt=val+opt=val]' comma-separated, "
+                         "e.g. '10:1,12:1,6:2,11:1:skip_loop_filter=all'")
+    ap.add_argument("--batch-buckets", default="8,16,24,32,40,48,56,64",
+                    help="batches are padded up to one of these sizes (few distinct shapes)")
     ap.add_argument("--shm-dir", default="/dev/shm")
     ap.add_argument("--strides", default="1,2,3")
     ap.add_argument("--streams", default="8,16,24,32,48,64,80,96")
@@ -654,24 +689,29 @@ def main():
         return
 
     ms = MetricSeries(out)
-    for stride in [int(s) for s in a.strides.split(",")]:
+    dcfgs = parse_dec_configs(a.dec_configs) if a.dec_configs else [(a.decoders, a.dec_threads, None)]
+    for stride, dcfg in [(int(s), d) for s in a.strides.split(",") for d in dcfgs]:
         tgt = round(src_fps / stride)
+        sfx = "" if len(dcfgs) == 1 else "_" + dcfg_label(dcfg)
         best = 0
         for n in [int(s) for s in a.streams.split(",")]:
-            row = run_point(eng, videos, n, stride, a)
+            row = run_point(eng, videos, n, stride, a, dcfg)
             row["rtf_min"] = row["src_fps_min"] / src_fps
             row["ok"] = row["rtf_min"] >= a.rtf_ok
             row.update(imgsz=a.imgsz, topk=a.topk, max_batch=a.max_batch)
             print("POINT", {k: (round(v, 3) if isinstance(v, float) else v) for k, v in row.items()}, flush=True)
             append_jsonl(out / f"{a.tag}_points.jsonl", row)
-            ms.log(n, f"{a.tag}_rtf_min_{tgt}fps", row["rtf_min"])
-            ms.log(n, f"{a.tag}_agg_infer_fps_{tgt}fps", row["agg_infer_fps"])
+            ms.log(n, f"{a.tag}_rtf_min_{tgt}fps{sfx}", row["rtf_min"])
+            ms.log(n, f"{a.tag}_agg_src_fps_{tgt}fps{sfx}", row["agg_src_fps"])
+            ms.log(n, f"{a.tag}_agg_infer_fps_{tgt}fps{sfx}", row["agg_infer_fps"])
+            head[f"{a.tag}_agg_src_fps_max_{tgt}fps{sfx}"] = max(
+                head.get(f"{a.tag}_agg_src_fps_max_{tgt}fps{sfx}", 0.0), row["agg_src_fps"])
             if row["ok"]:
                 best = n
             elif row["rtf_min"] < 0.6 * a.rtf_ok:
                 break
-        head[f"{a.tag}_max_streams_{tgt}fps"] = best
-        print(f"RESULT stride={stride} ({tgt}fps): max realtime streams = {best}", flush=True)
+        head[f"{a.tag}_max_streams_{tgt}fps{sfx}"] = best
+        print(f"RESULT stride={stride} ({tgt}fps){sfx}: max realtime streams = {best}", flush=True)
         merge_metrics_json(out, head)
     print("SUMMARY", head, flush=True)
 
