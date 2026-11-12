@@ -154,19 +154,19 @@ def _tracker(q, prog_raw, objs_raw, nfr_raw, stride, conf, barrier):
 def parse_outputs(out, in_h: int, nm: int = 32):
     """Find (dets[B,Q,6+nm] xyxy/conf/cls/coeffs, protos[B,nm,h,w]) in any backend's output."""
     import torch
+    # Iterative on purpose: a self-recursive closure is a reference cycle that kept every
+    # batch's output tensors (~0.3 GB at B=64) alive until the cyclic GC ran -> 10-25 GB of
+    # GPU memory in flight at 30 fps (found 2026-11-12).
     ts: list = []
-
-    def walk(o):
+    stack = [out]
+    while stack:
+        o = stack.pop()
         if isinstance(o, torch.Tensor):
             ts.append(o)
         elif isinstance(o, dict):
-            for v in o.values():
-                walk(v)
+            stack.extend(reversed(list(o.values())))
         elif isinstance(o, (list, tuple)):
-            for v in o:
-                walk(v)
-
-    walk(out)
+            stack.extend(reversed(o))
     protos = next((t for t in ts if t.ndim == 4 and t.shape[1] == nm and t.shape[2] * 4 == in_h), None)
     if protos is None:
         raise RuntimeError(f"no protos in outputs: {[tuple(t.shape) for t in ts]}")
@@ -628,7 +628,7 @@ def parse_dec_configs(spec: str):
     out = []
     for item in spec.split(","):
         parts = item.strip().split(":")
-        # '@' is accepted for '=' (projtool's run_script command recording truncates at 'k=v' args)
+        # '@' is accepted as an alias for '=' in option values
         opts = (dict(kv.replace("@", "=").split("=", 1) for kv in parts[2].split("+") if kv)
                 if len(parts) > 2 and parts[2] else None)
         out.append((int(parts[0]), int(parts[1]) if len(parts) > 1 else 1, opts))
