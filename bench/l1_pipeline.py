@@ -255,7 +255,8 @@ class GpuEngine:
         torch.cuda.set_stream(self.stream)
         self.r, self.nh, self.nw, self.in_h, self.in_w, self.top, self.left = letterbox_geom(a.imgsz)
         self.K, self.maxb = a.topk, a.max_batch
-        self.buckets = sorted({min(int(b), a.max_batch) for b in a.batch_buckets.split(",")} | {a.max_batch})
+        bl = [int(b) for b in a.batch_buckets.split(",") if b.strip()]
+        self.buckets = sorted({min(b, a.max_batch) for b in bl} | {a.max_batch}) if bl else []
         self.mask_res, self.pre_nms, self.nms_iou = a.mask_res, a.pre_nms, a.nms_iou
         self.off = torch.tensor([self.left, self.top, self.left, self.top], device=self.dev,
                                 dtype=torch.float32)
@@ -269,7 +270,7 @@ class GpuEngine:
         self.ys = torch.arange(self.in_h, device=self.dev, dtype=torch.float32)
         self.host = None
         self.host_pinned = False
-        for b in self.buckets:  # warm-up every shape we will ever run (TRT / cuBLAS / allocator)
+        for b in (self.buckets or (1, self.maxb, 1)):  # warm-up (TRT / cuBLAS / allocator)
             self.infer(torch.zeros((b, SLOT_BYTES), dtype=torch.uint8, device=self.dev))
         torch.cuda.synchronize()
 
@@ -384,6 +385,8 @@ class GpuEngine:
         self.host = None
 
     def bucket(self, B: int) -> int:
+        if not self.buckets:
+            return B
         return next((b for b in self.buckets if b >= B), self.maxb)
 
     def launch(self, idx: np.ndarray):
@@ -444,7 +447,7 @@ def run_point(eng: GpuEngine, videos, n, stride, a, dcfg=(0, 1, None)):
     ncpu = effective_cpus()
     # one tracker proc handled >=1600 updates/s with zero backlog in L1; a 2nd one costs a decoder
     T = a.trackers or (1 if min(n * 30 / stride, 3600) <= 2000 else 2)
-    D = dec_n or max(1, min(n, ncpu - T - 1))
+    D = dec_n or max(1, min(n, ncpu - T))
     S = a.slots
     nring = n * S
     need = nring * SLOT_BYTES
@@ -664,8 +667,8 @@ def main():
     ap.add_argument("--dec-configs", default="",
                     help="sweep decoder setups: 'D:threads[:opt@val+opt@val]' comma-separated, "
                          "e.g. '10:1,12:1,6:2,11:1:skip_loop_filter@all'")
-    ap.add_argument("--batch-buckets", default="8,16,24,32,40,48,56,64",
-                    help="batches are padded up to one of these sizes (few distinct shapes)")
+    ap.add_argument("--batch-buckets", default="",
+                    help="pad batches up to one of these sizes, e.g. '8,16,32,64' (default: no padding)")
     ap.add_argument("--shm-dir", default="/dev/shm")
     ap.add_argument("--strides", default="1,2,3")
     ap.add_argument("--streams", default="8,16,24,32,48,64,80,96")
