@@ -30,11 +30,25 @@ NAMES=(
   mice_7_664x630_67Hz_7min21s.mp4
 )
 
+fetch() {  # download to .part, verify size against Content-Length, then rename
+  local n=$1 url="$BASE/$1?download=1" dst="$RAW/$1"
+  local want
+  want=$(curl -sIL --max-time 30 "$url" | grep -i '^content-length' | tail -1 | tr -dc 0-9)
+  if [ -s "$dst" ] && [ "$(stat -c %s "$dst")" = "$want" ]; then echo "== have $n"; return 0; fi
+  wget -q -c --tries=10 --timeout=60 -O "$dst.part" "$url"
+  local got; got=$(stat -c %s "$dst.part")
+  if [ -n "$want" ] && [ "$got" != "$want" ]; then
+    echo "!! $n size $got != $want"; rm -f "$dst.part"; return 1
+  fi
+  mv "$dst.part" "$dst"; echo "== got $n ($got bytes)"
+}
+
 echo "== download ${#NAMES[@]} files in parallel"
-for n in "${NAMES[@]}"; do
-  wget -q -c --tries=10 --timeout=60 -O "$RAW/$n" "$BASE/$n?download=1" &
-done
-wait
+pids=()
+for n in "${NAMES[@]}"; do fetch "$n" & pids+=($!); done
+fail=0
+for p in "${pids[@]}"; do wait "$p" || fail=1; done
+[ "$fail" = 0 ] || { echo "!! download failed"; exit 1; }
 for n in "${NAMES[@]}"; do
   echo "== $n"
   ffprobe -v error -select_streams v:0 \
