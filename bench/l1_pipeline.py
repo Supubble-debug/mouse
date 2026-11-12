@@ -628,7 +628,9 @@ def parse_dec_configs(spec: str):
     out = []
     for item in spec.split(","):
         parts = item.strip().split(":")
-        opts = dict(kv.split("=", 1) for kv in parts[2].split("+") if kv) if len(parts) > 2 and parts[2] else None
+        # '@' is accepted for '=' (projtool's run_script command recording truncates at 'k=v' args)
+        opts = (dict(kv.replace("@", "=").split("=", 1) for kv in parts[2].split("+") if kv)
+                if len(parts) > 2 and parts[2] else None)
         out.append((int(parts[0]), int(parts[1]) if len(parts) > 1 else 1, opts))
     return out
 
@@ -660,8 +662,8 @@ def main():
     ap.add_argument("--trackers", type=int, default=0, help="0 = auto")
     ap.add_argument("--dec-threads", type=int, default=1)
     ap.add_argument("--dec-configs", default="",
-                    help="sweep decoder setups: 'D:threads[:opt=val+opt=val]' comma-separated, "
-                         "e.g. '10:1,12:1,6:2,11:1:skip_loop_filter=all'")
+                    help="sweep decoder setups: 'D:threads[:opt@val+opt@val]' comma-separated, "
+                         "e.g. '10:1,12:1,6:2,11:1:skip_loop_filter@all'")
     ap.add_argument("--batch-buckets", default="8,16,24,32,40,48,56,64",
                     help="batches are padded up to one of these sizes (few distinct shapes)")
     ap.add_argument("--shm-dir", default="/dev/shm")
