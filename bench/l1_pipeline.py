@@ -247,6 +247,10 @@ class GpuEngine:
         self.torch, self.F = torch, F
         torch.backends.cudnn.benchmark = False
         self.dev = torch.device("cuda:0")
+        # all GPU work of this process on one non-default stream: TRT enqueueV3 on the legacy
+        # default stream adds cudaStreamSynchronize calls (kills CPU/GPU overlap)
+        self.stream = torch.cuda.Stream(device=self.dev)
+        torch.cuda.set_stream(self.stream)
         self.r, self.nh, self.nw, self.in_h, self.in_w, self.top, self.left = letterbox_geom(a.imgsz)
         self.K, self.maxb = a.topk, a.max_batch
         self.mask_res, self.pre_nms, self.nms_iou = a.mask_res, a.pre_nms, a.nms_iou
