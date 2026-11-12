@@ -124,12 +124,15 @@ def _tracker(q, prog_raw, objs_raw, nfr_raw, stride, conf, barrier):
     from ultralytics.engine.results import Boxes
     from ultralytics.trackers.byte_tracker import BYTETracker
 
-    cfg = SimpleNamespace(**yaml.safe_load(TRACKER_YAML.read_text()))
+    cfg = yaml.safe_load(TRACKER_YAML.read_text())
+    # BYTETracker(args) no longer takes frame_rate; track_buffer is in frames, so scale it
+    # to the analysed frame rate (buffer is specified for 30 fps).
+    cfg["track_buffer"] = max(1, round(cfg["track_buffer"] / stride))
+    cfg = SimpleNamespace(**cfg)
     prog = np.frombuffer(prog_raw, np.int64)
     objs = np.frombuffer(objs_raw, np.int64)
     nfr = np.frombuffer(nfr_raw, np.int64)
     trackers = {}
-    fr = max(1, round(30 / stride))
     barrier.wait()
     while True:
         msg = q.get()
@@ -137,7 +140,7 @@ def _tracker(q, prog_raw, objs_raw, nfr_raw, stride, conf, barrier):
             break
         for s, c, det in msg:
             if s not in trackers:
-                trackers[s] = BYTETracker(cfg, frame_rate=fr)
+                trackers[s] = BYTETracker(cfg)
             d = det[det[:, 4] >= conf]
             out = trackers[s].update(Boxes(d[:, :6], (H, W)))
             objs[s] += len(out)
@@ -404,8 +407,19 @@ def run_point(eng: GpuEngine, videos, n, stride, a):
     snap0 = None
     g = c = None
     pending = None
+    next_alive = 0.0
     while True:
         now = time.perf_counter()
+        if now >= next_alive:  # a dead worker would silently freeze progress -> fail loudly
+            dead = [p.name for p in procs if not p.is_alive()]
+            if dead:
+                stop.value = 1
+                for p in procs:
+                    p.terminate()
+                eng.detach_ring()
+                os.unlink(ring_path)
+                raise RuntimeError(f"worker process(es) died: {dead}")
+            next_alive = now + 1.0
         if snap0 is None and now >= t_meas0:
             snap0 = (now, prog.copy(), objs.copy(), nfr.copy(), dict(st))
             g, c = GpuSampler().__enter__(), CpuSampler().__enter__()
@@ -509,7 +523,8 @@ def main():
     ap.add_argument("--videos", default=None)
     ap.add_argument("--model", default=os.path.join(os.environ.get("DATA_ROOT", "data"),
                                                     "weights", "yolo26n-seg.pt"))
-    ap.add_argument("--backend", choices=["trt", "torch"], default="trt")
+    # trt: ultralytics' TRT 11 export currently yields NaN outputs here (2026-11-12) -> torch default
+    ap.add_argument("--backend", choices=["trt", "torch"], default="torch")
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--max-batch", type=int, default=64)
     ap.add_argument("--min-batch", type=int, default=0, help="0 = auto (half the streams)")
@@ -536,6 +551,9 @@ def main():
     print(f"backend={eng.backend_name} input={eng.in_h}x{eng.in_w} cpus={effective_cpus()}", flush=True)
     head = {"source_fps": src_fps, **check(eng, videos[0], a)}
     merge_metrics_json(out, head)
+    if not np.isfinite(head["check_top1_iou"]) or head["check_top1_iou"] < 0.5:
+        raise SystemExit(f"{eng.backend_name} detections disagree with reference "
+                         f"(top1 IoU {head['check_top1_iou']}); not benchmarking")
     if head["check_input_mad"] > 0.05:
         raise SystemExit(f"preprocessing mismatch (MAD {head['check_input_mad']:.3f}); not benchmarking")
     if a.check_only:
